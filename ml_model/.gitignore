@@ -1,0 +1,36 @@
+# ml_model/.gitignore - Version simplifiée
+
+# Environnement virtuel Python
+venv/
+.env/
+
+# Fichiers Python compilés
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers sensibles (CLÉS API)
+.env
+.env.local
+secrets.json
+
+# Données et cache
+data/dailymed/*
+data/chroma_db/*
+data/temp/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Système
+.DS_Store
+Thumbs.db
+
+# Base de données
+*.db
+*.sqlite

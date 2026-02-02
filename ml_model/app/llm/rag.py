@@ -1,146 +1,126 @@
-#rag.py : Système RAG
 import chromadb
 from chromadb.config import Settings
-from typing import List, Dict
-import logging
 from sentence_transformers import SentenceTransformer
 import numpy as np
+from typing import List, Dict
+import logging
+from app.config import config
 
 logger = logging.getLogger(__name__)
 
 class RAGSystem:
-    """
-    Système RAG (Retrieval-Augmented Generation)
-    Pour la recherche sémantique dans la base de connaissances
-    """
+    """Système RAG (Retrieval Augmented Generation) pour DailyMed"""
     
-    def __init__(self, drug_database):
-        self.drug_db = drug_database
-        
-        # Initialiser le modèle d'embeddings
-        logger.info("Chargement du modèle d'embeddings...")
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        
-        # Initialiser la base vectorielle
-        self._init_vector_store()
+    def __init__(self):
+        self.embedding_model = None
+        self.chroma_client = None
+        self.collection = None
+        self._initialize()
     
-    def _init_vector_store(self):
-        """Initialise la base de données vectorielle"""
+    def _initialize(self):
+        """Initialise le système RAG"""
         try:
+            # Initialiser ChromaDB
             self.chroma_client = chromadb.Client(Settings(
-                chroma_db_impl="duckdb+parquet",
-                persist_directory="./chroma_db"
+                persist_directory=config.CHROMA_PERSIST_DIR,
+                chroma_db_impl="duckdb+parquet"
             ))
             
-            # Créer ou récupérer la collection
+            # Charger ou créer la collection
             self.collection = self.chroma_client.get_or_create_collection(
-                name="pharma_documents",
-                metadata={"hnsw:space": "cosine"}
+                name="dailymed_drugs",
+                metadata={"description": "Base de données des médicaments DailyMed"}
             )
             
-            logger.info("✅ Base vectorielle initialisée")
+            logger.info(f"✅ RAG System initialisé - {self.collection.count()} documents")
             
         except Exception as e:
-            logger.error(f"Erreur d'initialisation vector store: {e}")
-            raise
+            logger.error(f"❌ Erreur initialisation RAG: {str(e)}")
+            self.collection = None
     
-    async def retrieve_relevant_documents(self, query: str, limit: int = 5) -> List[Dict]:
+    def add_documents(self, documents: List[Dict]):
         """
-        Recherche les documents les plus pertinents pour une requête
+        Ajoute des documents à la base vectorielle
+        
+        Args:
+            documents: Liste de documents avec 'id', 'text', 'metadata'
         """
+        if not self.collection:
+            logger.error("Collection ChromaDB non initialisée")
+            return
+        
         try:
-            # Générer l'embedding de la requête
-            query_embedding = self.embedding_model.encode(query).tolist()
+            ids = [doc["id"] for doc in documents]
+            texts = [doc["text"] for doc in documents]
+            metadatas = [doc.get("metadata", {}) for doc in documents]
             
-            # Recherche dans la base vectorielle
+            self.collection.add(
+                documents=texts,
+                metadatas=metadatas,
+                ids=ids
+            )
+            
+            logger.info(f"📚 {len(documents)} documents ajoutés à la base vectorielle")
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur ajout documents: {str(e)}")
+    
+    def search_similar(self, query: str, n_results: int = 5) -> List[Dict]:
+        """
+        Recherche des documents similaires
+        
+        Args:
+            query: Requête de recherche
+            n_results: Nombre de résultats
+        """
+        if not self.collection or self.collection.count() == 0:
+            logger.warning("Base vectorielle vide ou non initialisée")
+            return []
+        
+        try:
             results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=limit,
-                include=["documents", "metadatas", "distances"]
+                query_texts=[query],
+                n_results=n_results
             )
             
             # Formater les résultats
-            documents = []
-            for i in range(len(results['ids'][0])):
-                doc = {
-                    "id": results['ids'][0][i],
-                    "content": results['documents'][0][i],
-                    "metadata": results['metadatas'][0][i],
-                    "score": 1 - results['distances'][0][i],  # Convertir distance en score
-                    "source": "vector_db"
-                }
-                documents.append(doc)
+            formatted_results = []
+            if results["documents"]:
+                for i, doc in enumerate(results["documents"][0]):
+                    formatted_results.append({
+                        "text": doc,
+                        "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
+                        "distance": results["distances"][0][i] if results["distances"] else 0
+                    })
             
-            logger.info(f"Retrieved {len(documents)} documents for query")
-            return documents
+            return formatted_results
             
         except Exception as e:
-            logger.error(f"Erreur dans retrieve_relevant_documents: {e}")
-            # Fallback: recherche textuelle simple
-            return await self._fallback_search(query, limit)
-    
-    async def _fallback_search(self, query: str, limit: int) -> List[Dict]:
-        """Recherche de secours si la base vectorielle échoue"""
-        logger.warning("Utilisation de la recherche de secours")
-        
-        # Recherche simple dans la base de données
-        try:
-            drugs = await self.drug_db.search_drugs(query, limit)
-            
-            documents = []
-            for drug in drugs:
-                doc = {
-                    "id": drug.get("id", ""),
-                    "content": f"{drug.get('name', '')} - {drug.get('description', '')}",
-                    "metadata": drug,
-                    "score": 0.5,  # Score par défaut
-                    "source": "drug_database_fallback"
-                }
-                documents.append(doc)
-            
-            return documents
-            
-        except Exception as e:
-            logger.error(f"Erreur recherche de secours: {e}")
+            logger.error(f"❌ Erreur recherche: {str(e)}")
             return []
     
-    async def add_documents(self, documents: List[Dict]):
+    def get_drug_context(self, drug_name: str, max_context: int = 3) -> str:
         """
-        Ajoute des documents à la base vectorielle
+        Obtient le contexte pour un médicament
+        
+        Args:
+            drug_name: Nom du médicament
+            max_context: Nombre maximum de contextes
         """
-        try:
-            ids = []
-            texts = []
-            metadatas = []
-            embeddings = []
-            
-            for i, doc in enumerate(documents):
-                doc_id = f"doc_{i}_{hash(doc['content'])}"
-                ids.append(doc_id)
-                texts.append(doc['content'])
-                metadatas.append(doc.get('metadata', {}))
-                
-                # Générer l'embedding
-                embedding = self.embedding_model.encode(doc['content']).tolist()
-                embeddings.append(embedding)
-            
-            # Ajouter à la collection
-            self.collection.add(
-                ids=ids,
-                documents=texts,
-                metadatas=metadatas,
-                embeddings=embeddings
-            )
-            
-            logger.info(f"Ajouté {len(documents)} documents à la base vectorielle")
-            
-        except Exception as e:
-            logger.error(f"Erreur ajout documents: {e}")
-            raise
+        # Recherche simple par nom
+        results = self.search_similar(drug_name, n_results=max_context)
+        
+        # Concaténer les résultats
+        context_parts = []
+        for result in results:
+            if result["distance"] < 1.0 - config.SIMILARITY_THRESHOLD:
+                context_parts.append(result["text"])
+        
+        return "\n\n---\n\n".join(context_parts) if context_parts else "Aucune information trouvée dans la base de données."
     
-    async def get_document_count(self) -> int:
-        """Retourne le nombre de documents dans la collection"""
-        try:
-            return self.collection.count()
-        except:
-            return 0
+    def is_ready(self) -> bool:
+        """Vérifie si le système RAG est prêt"""
+        return self.collection is not None and self.collection.count() > 0
+
+# Instance globale
+rag_system = RAGSystem()

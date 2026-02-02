@@ -1,153 +1,233 @@
-#main.py - API FastAPI principale
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from contextlib import asynccontextmanager
+import uvicorn
+from typing import List, Dict, Optional
 import logging
-from typing import Optional
 
-from app.config import settings
-from app.llm.llm_engine import LLMEngine
-from app.llm.rag import RAGSystem
-from app.database.dailymed_loader import DrugDatabase
+from app.config import config
+from app.services.drug_service import DrugService
+from app.services.interaction_service import InteractionService
 
-# Configuration logging
+# Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Variables globales pour les ressources partagées
-llm_engine = None
-rag_system = None
-drug_db = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Gestion du cycle de vie de l'application
-    Initialise les ressources au démarrage, les nettoie à l'arrêt
-    """
-    global llm_engine, rag_system, drug_db
-    
-    # Initialisation au démarrage
-    logger.info("Initialisation des services AI...")
-    
-    try:
-        # Initialiser la base de données des médicaments
-        drug_db = DrugDatabase()
-        await drug_db.initialize()
-        
-        # Initialiser le système RAG
-        rag_system = RAGSystem(drug_db)
-        
-        # Initialiser le moteur LLM
-        llm_engine = LLMEngine(rag_system)
-        
-        logger.info("✅ Services AI initialisés avec succès")
-        
-    except Exception as e:
-        logger.error(f"❌ Erreur d'initialisation: {e}")
-        raise
-    
-    yield  # L'application fonctionne
-    
-    # Nettoyage à l'arrêt
-    logger.info("Arrêt des services AI...")
-    if drug_db:
-        await drug_db.close()
-
-# Création de l'application FastAPI
+# Initialisation de l'application
 app = FastAPI(
-    title="Pharma AI Assistant API",
-    description="Microservice d'IA pour l'assistant pharmaceutique",
-    version="1.0.0",
-    lifespan=lifespan
+    title="Pharma Assistant API",
+    description="API intelligente d'assistance pharmaceutique avec DailyMed",
+    version="1.0.0"
 )
 
-# Configuration CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=["*"],  # À restreindre en production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Dépendance pour vérifier l'API key
-async def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    if not x_api_key or x_api_key != settings.API_KEY:
-        raise HTTPException(status_code=401, detail="Clé API invalide")
-    return x_api_key
+# Initialisation des services
+drug_service = DrugService()
+interaction_service = InteractionService()
 
-@app.get("/health")
-async def health_check():
-    """Endpoint de vérification de santé du service"""
+@app.on_event("startup")
+async def startup_event():
+    """Initialisation au démarrage"""
+    logger.info(" Démarrage du Pharma Assistant API")
+    logger.info(f"Modèle LLM: {config.OPENAI_MODEL}")
+    logger.info(f" Langues supportées: {config.SUPPORTED_LANGUAGES}")
+
+@app.get("/")
+async def root():
+    """Endpoint racine"""
     return {
-        "status": "healthy",
-        "service": "pharma-ai-service",
+        "service": "Pharma Assistant API",
         "version": "1.0.0",
-        "llm_ready": llm_engine is not None
+        "status": "operational",
+        "endpoints": [
+            "/api/drug-info",
+            "/api/check-interactions",
+            "/api/search-drugs",
+            "/api/ask-question"
+        ]
     }
 
-@app.post("/api/llm/ask", dependencies=[Depends(verify_api_key)])
-async def ask_llm(query: dict):
+@app.get("/api/health")
+async def health_check():
+    """Vérification de santé"""
+    return {
+        "status": "healthy",
+        "model": config.OPENAI_MODEL,
+        "environment": config.APP_ENV
+    }
+
+@app.post("/api/drug-info")
+async def get_drug_info(
+    drug_name: str,
+    language: str = config.DEFAULT_LANGUAGE
+):
     """
-    Endpoint principal pour les questions médicales
+    Obtient des informations sur un médicament
+    
+    Args:
+        drug_name: Nom du médicament
+        language: Langue de réponse (fr/en)
     """
     try:
-        question = query.get("query", "")
-        context = query.get("context", {})
+        if language not in config.SUPPORTED_LANGUAGES:
+            language = config.DEFAULT_LANGUAGE
+            
+        logger.info(f"Recherche info médicament: {drug_name} ({language})")
         
-        if not question:
-            raise HTTPException(status_code=400, detail="Question requise")
-        
-        # Traiter la requête via le moteur LLM
-        response = await llm_engine.process_query(
-            question=question,
-            context=context
+        result = await drug_service.get_drug_information(
+            drug_name=drug_name,
+            language=language
         )
         
-        return JSONResponse(content=response)
+        return JSONResponse(content=result)
         
     except Exception as e:
-        logger.error(f"Erreur lors du traitement LLM: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Erreur: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des informations: {str(e)}"
+        )
 
-@app.get("/api/drugs/search", dependencies=[Depends(verify_api_key)])
-async def search_drugs(q: str, limit: int = 10):
+@app.post("/api/check-interactions")
+async def check_interactions(
+    drugs: List[str],
+    language: str = config.DEFAULT_LANGUAGE
+):
     """
-    Recherche sémantique de médicaments
+    Vérifie les interactions entre plusieurs médicaments
+    
+    Args:
+        drugs: Liste des noms de médicaments
+        language: Langue de réponse
     """
     try:
-        results = await drug_db.search_drugs(q, limit)
-        return {"results": results}
-    except Exception as e:
-        logger.error(f"Erreur recherche médicaments: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/drugs/interactions", dependencies=[Depends(verify_api_key)])
-async def check_interactions(data: dict):
-    """
-    Vérifie les interactions médicamenteuses
-    """
-    try:
-        drugs = data.get("drugs", [])
-        patient_info = data.get("patient_info", {})
-        
         if len(drugs) < 2:
-            raise HTTPException(status_code=400, detail="Au moins 2 médicaments requis")
+            raise HTTPException(
+                status_code=400,
+                detail="Au moins 2 médicaments sont requis pour vérifier les interactions"
+            )
         
-        interactions = await drug_db.check_interactions(drugs, patient_info)
-        return {"interactions": interactions}
+        if language not in config.SUPPORTED_LANGUAGES:
+            language = config.DEFAULT_LANGUAGE
+            
+        logger.info(f"⚗️  Vérification interactions: {drugs} ({language})")
+        
+        result = await interaction_service.check_drug_interactions(
+            drugs=drugs,
+            language=language
+        )
+        
+        return JSONResponse(content=result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la vérification des interactions: {str(e)}"
+        )
+
+@app.get("/api/search-drugs")
+async def search_drugs(
+    query: str = Query(..., min_length=2),
+    limit: int = Query(10, ge=1, le=50),
+    language: str = config.DEFAULT_LANGUAGE
+):
+    """
+    Recherche de médicaments par nom
+    
+    Args:
+        query: Terme de recherche
+        limit: Nombre maximum de résultats
+        language: Langue de réponse
+    """
+    try:
+        logger.info(f"🔎 Recherche médicaments: '{query}'")
+        
+        results = await drug_service.search_drugs(
+            query=query,
+            limit=limit,
+            language=language
+        )
+        
+        return {
+            "query": query,
+            "count": len(results),
+            "results": results
+        }
         
     except Exception as e:
-        logger.error(f"Erreur vérification interactions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Erreur: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la recherche: {str(e)}"
+        )
 
-# Handler d'erreurs global
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    logger.error(f"Erreur non gérée: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Erreur interne du serveur"}
+@app.post("/api/ask-question")
+async def ask_question(
+    question: str,
+    context: Optional[Dict] = None,
+    language: str = config.DEFAULT_LANGUAGE
+):
+    """
+    Pose une question générale sur les médicaments
+    
+    Args:
+        question: Question à poser
+        context: Contexte supplémentaire
+        language: Langue de réponse
+    """
+    try:
+        if not question or len(question.strip()) < 3:
+            raise HTTPException(
+                status_code=400,
+                detail="La question doit contenir au moins 3 caractères"
+            )
+            
+        logger.info(f"❓ Question: '{question[:50]}...' ({language})")
+        
+        result = await drug_service.answer_question(
+            question=question,
+            context=context or {},
+            language=language
+        )
+        
+        return JSONResponse(content=result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors du traitement de la question: {str(e)}"
+        )
+
+@app.get("/api/status")
+async def get_status():
+    """Statut du système"""
+    return {
+        "service": "Pharma Assistant ML API",
+        "llm_model": config.OPENAI_MODEL,
+        "environment": config.APP_ENV,
+        "dailymed_connected": drug_service.is_dailymed_available(),
+        "vector_db_ready": drug_service.is_vector_db_ready(),
+        "supported_languages": config.SUPPORTED_LANGUAGES
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=config.APP_HOST,
+        port=config.APP_PORT,
+        reload=config.DEBUG
     )
